@@ -41,7 +41,7 @@ import functools
 import ssl
 import time
 import weakref
-from collections.abc import Awaitable, Callable
+from collections.abc import Awaitable, Callable, Container
 from io import BytesIO
 from typing import Any, Optional, Type, Union, cast
 
@@ -53,7 +53,19 @@ from tornado.concurrent import (
 )
 from tornado.escape import native_str, utf8
 from tornado.ioloop import IOLoop
+from tornado.log import gen_log
 from tornado.util import Configurable
+
+
+# Status codes that are retried by default when ``max_retries`` is used
+# and ``retry_statuses`` is not specified.
+_DEFAULT_RETRY_STATUSES = frozenset({500, 502, 503, 504})
+
+# Errors that are retried by default when ``max_retries`` is used and
+# ``retry_exceptions`` is not specified: any error that is not an HTTP
+# error response (i.e. network-level failures such as timeouts, refused
+# or reset connections).
+_DEFAULT_RETRY_EXCEPTIONS = (Exception,)
 
 
 class HTTPClient:
@@ -271,6 +283,11 @@ class AsyncHTTPClient(Configurable):
         Instead, you must check the response's ``error`` attribute or
         call its `~HTTPResponse.rethrow` method.
 
+        If the request's ``max_retries`` attribute is non-zero, failed
+        requests are retried with an exponential backoff (see
+        `HTTPRequest` for the ``retry_*`` arguments that control this
+        behavior). By default no retries are attempted.
+
         .. versionchanged:: 6.0
 
            The ``callback`` argument was removed. Use the returned
@@ -296,7 +313,67 @@ class AsyncHTTPClient(Configurable):
         request_proxy = _RequestProxy(request, self.defaults)
         future: Future[HTTPResponse] = Future()
 
+        max_retries = request_proxy.max_retries or 0
+        retry_statuses = request_proxy.retry_statuses
+        if retry_statuses is None:
+            retry_statuses = _DEFAULT_RETRY_STATUSES
+        retry_exceptions = request_proxy.retry_exceptions
+        if retry_exceptions is None:
+            retry_exceptions = _DEFAULT_RETRY_EXCEPTIONS
+        else:
+            retry_exceptions = tuple(retry_exceptions)
+        retry_backoff = request_proxy.retry_backoff
+        retry_backoff_max = request_proxy.retry_backoff_max
+        retry_timeout = request_proxy.retry_timeout
+
+        start_time = self.io_loop.time()
+        retries = 0
+
+        def retry_reason(response: "HTTPResponse") -> Optional[str]:
+            # Returns a human-readable reason if the failed response
+            # should be retried, or None if it should not.
+            error = response.error
+            if error is None:
+                return None
+            if isinstance(error, HTTPError) and response._error_is_response_code:
+                if response.code in retry_statuses:
+                    return "HTTP %d: %s" % (response.code, response.reason)
+                return None
+            if isinstance(error, retry_exceptions):
+                return "%s: %s" % (type(error).__name__, error)
+            return None
+
         def handle_response(response: "HTTPResponse") -> None:
+            nonlocal retries
+            reason = retry_reason(response) if retries < max_retries else None
+            if reason is not None and not future.cancelled():
+                elapsed = self.io_loop.time() - start_time
+                delay = min(retry_backoff * (2**retries), retry_backoff_max)
+                if retry_timeout is None or elapsed + delay <= retry_timeout:
+                    retries += 1
+                    gen_log.info(
+                        "Retrying %s %s in %.2fs (attempt %d of %d): %s",
+                        request.method,
+                        request.url,
+                        delay,
+                        retries + 1,
+                        max_retries + 1,
+                        reason,
+                    )
+                    self.io_loop.call_later(
+                        delay, self.fetch_impl, request_proxy, handle_response
+                    )
+                    return
+                gen_log.warning(
+                    "Not retrying %s %s after %d attempt(s) in %.2fs: "
+                    "retry_timeout of %.2fs would be exceeded (last error: %s)",
+                    request.method,
+                    request.url,
+                    retries + 1,
+                    elapsed,
+                    retry_timeout,
+                    reason,
+                )
             if response.error:
                 if raise_error or not response._error_is_response_code:
                     future_set_exception_unless_cancelled(future, response.error)
@@ -350,6 +427,9 @@ class HTTPRequest:
         follow_redirects=True,
         max_redirects=5,
         decompress_response=True,
+        max_retries=0,
+        retry_backoff=0.1,
+        retry_backoff_max=10.0,
         proxy_password="",
         allow_nonstandard_methods=False,
         validate_cert=True,
@@ -392,6 +472,12 @@ class HTTPRequest:
         expect_100_continue: bool = False,
         decompress_response: bool | None = None,
         ssl_options: dict[str, Any] | ssl.SSLContext | None = None,
+        max_retries: int | None = None,
+        retry_statuses: Container[int] | None = None,
+        retry_exceptions: tuple[type[BaseException], ...] | None = None,
+        retry_backoff: float | None = None,
+        retry_backoff_max: float | None = None,
+        retry_timeout: float | None = None,
     ) -> None:
         r"""All parameters except ``url`` are optional.
 
@@ -481,6 +567,31 @@ class HTTPRequest:
            ``Expect: 100-continue`` header and wait for a continue response
            before sending the request body.  Only supported with
            ``simple_httpclient``.
+        :arg int max_retries: Maximum number of times a failed request is
+           retried, in addition to the initial attempt. Default is 0, which
+           disables retries. Which failures are retried is controlled by
+           ``retry_statuses`` and ``retry_exceptions``; the delay between
+           attempts is controlled by ``retry_backoff``, ``retry_backoff_max``,
+           and ``retry_timeout``. New in Tornado 6.6.
+        :arg retry_statuses: HTTP response status codes that trigger a
+           retry. Defaults to ``{500, 502, 503, 504}`` when ``max_retries``
+           is non-zero. New in Tornado 6.6.
+        :type retry_statuses: `~collections.abc.Container` of `int`
+        :arg retry_exceptions: Exception types that trigger a retry. Only
+           applies to errors that are not HTTP error responses, such as
+           timeouts and connection failures. Defaults to all such errors
+           when ``max_retries`` is non-zero. New in Tornado 6.6.
+        :type retry_exceptions: `tuple` of exception types
+        :arg float retry_backoff: Delay in seconds before the first retry.
+           The delay doubles after each subsequent attempt, up to
+           ``retry_backoff_max``. Default 0.1. New in Tornado 6.6.
+        :arg float retry_backoff_max: Maximum delay in seconds between
+           retries. Default 10.0. New in Tornado 6.6.
+        :arg float retry_timeout: Overall time budget in seconds for the
+           request, including all retries and backoff delays. A retry that
+           would exceed this budget is not attempted and the request fails
+           with the most recent error. Default is no budget. New in
+           Tornado 6.6.
 
         .. note::
 
@@ -546,6 +657,12 @@ class HTTPRequest:
         self.client_cert = client_cert
         self.ssl_options = ssl_options
         self.expect_100_continue = expect_100_continue
+        self.max_retries = max_retries
+        self.retry_statuses = retry_statuses
+        self.retry_exceptions = retry_exceptions
+        self.retry_backoff = retry_backoff
+        self.retry_backoff_max = retry_backoff_max
+        self.retry_timeout = retry_timeout
         self.start_time = time.time()
 
     @property

@@ -40,6 +40,13 @@ Type annotation changes
 - The minimum supported version of libcurl is now 7.81 (which is the version shipped by
   Ubuntu 22.04 LTS).
 
+``tornado.httpclient``
+~~~~~~~~~~~~~~~~~~~~~~
+
+- Failed requests may now be retried automatically via the new ``max_retries``,
+  ``retry_statuses``, ``retry_exceptions``, ``retry_backoff``, ``retry_backoff_max``,
+  and ``retry_timeout`` arguments to `.HTTPRequest`. Retries are disabled by default.
+
 ``tornado.simple_httpclient``
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 

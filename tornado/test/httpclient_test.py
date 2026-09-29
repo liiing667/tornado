@@ -41,7 +41,7 @@ from tornado.httpserver import HTTPServer
 from tornado.httputil import HTTPHeaders, format_timestamp
 from tornado.ioloop import IOLoop
 from tornado.iostream import IOStream
-from tornado.log import app_log, gen_log
+from tornado.log import access_log, app_log, gen_log
 from tornado.test.util import (
     AsyncHTTPTestCase,
     TestCase,
@@ -120,6 +120,19 @@ class CountdownHandler(RequestHandler):
             self.redirect(self.reverse_url("countdown", count - 1))
         else:
             self.write("Zero")
+
+
+class RetryHandler(RequestHandler):
+    def get(self):
+        attempts = self.application.settings.get("retry_attempts", 0) + 1
+        self.application.settings["retry_attempts"] = attempts
+        self.set_header("X-Attempt-Count", str(attempts))
+        fail_times = int(self.get_argument("fail_times"))
+        if attempts <= fail_times:
+            self.set_status(int(self.get_argument("status", 500)))
+            self.finish("error")
+        else:
+            self.finish("ok")
 
 
 class EchoPostHandler(RequestHandler):
@@ -303,6 +316,7 @@ class HTTPClientCommonTestCase(AsyncHTTPTestCase):
                 url("/chunk", ChunkHandler),
                 url("/auth", AuthHandler),
                 url("/countdown/([0-9]+)", CountdownHandler, name="countdown"),
+                url("/retry", RetryHandler),
                 url("/echopost", EchoPostHandler),
                 url("/user_agent", UserAgentHandler),
                 url("/304_with_content_length", ContentLength304Handler),
@@ -560,6 +574,88 @@ Transfer-Encoding: chunked
         # error, but libcurl doesn't treat this as an error, so we
         # don't either).
         self.assertEqual(301, response.code)
+
+    @gen_test
+    def test_retry_succeeds_after_failures(self):
+        with ExpectLog(access_log, r"\d+ GET /retry", required=False), ExpectLog(
+            gen_log, "Retrying .*attempt [23] of 4", level=logging.INFO
+        ):
+            response = yield self.http_client.fetch(
+                self.get_url("/retry?fail_times=2"),
+                max_retries=3,
+                retry_backoff=0.01,
+            )
+        self.assertEqual(response.code, 200)
+        self.assertEqual(response.body, b"ok")
+        self.assertEqual(response.headers["X-Attempt-Count"], "3")
+
+    @gen_test
+    def test_retry_exhausted(self):
+        with ExpectLog(access_log, r"\d+ GET /retry", required=False), ExpectLog(
+            gen_log, "Retrying", level=logging.INFO
+        ):
+            response = yield self.http_client.fetch(
+                self.get_url("/retry?fail_times=5"),
+                max_retries=2,
+                retry_backoff=0.01,
+                raise_error=False,
+            )
+        self.assertEqual(response.code, 500)
+        self.assertEqual(response.headers["X-Attempt-Count"], "3")
+
+    @gen_test
+    def test_no_retry_by_default(self):
+        with ExpectLog(access_log, r"\d+ GET /retry", required=False):
+            response = yield self.http_client.fetch(
+                self.get_url("/retry?fail_times=1"), raise_error=False
+            )
+        self.assertEqual(response.code, 500)
+        self.assertEqual(response.headers["X-Attempt-Count"], "1")
+
+    @gen_test
+    def test_retry_status_not_configured(self):
+        # A 503 is not retried when only 500 is configured.
+        with ExpectLog(access_log, r"\d+ GET /retry", required=False):
+            response = yield self.http_client.fetch(
+                self.get_url("/retry?fail_times=1&status=503"),
+                max_retries=3,
+                retry_statuses={500},
+                retry_backoff=0.01,
+                raise_error=False,
+            )
+        self.assertEqual(response.code, 503)
+        self.assertEqual(response.headers["X-Attempt-Count"], "1")
+
+    @gen_test
+    def test_retry_timeout_budget(self):
+        # The backoff delay (10s) exceeds the remaining retry budget, so
+        # the request fails after the initial attempt without retrying.
+        with ExpectLog(access_log, r"\d+ GET /retry", required=False), ExpectLog(
+            gen_log, "Not retrying .*retry_timeout"
+        ):
+            response = yield self.http_client.fetch(
+                self.get_url("/retry?fail_times=5"),
+                max_retries=5,
+                retry_backoff=10.0,
+                retry_timeout=0.05,
+                raise_error=False,
+            )
+        self.assertEqual(response.code, 500)
+        self.assertEqual(response.headers["X-Attempt-Count"], "1")
+
+    @gen_test
+    def test_retry_on_connection_error(self):
+        # Network-level errors (as opposed to HTTP error responses) are
+        # retried by default when max_retries is set.
+        with ExpectLog(gen_log, "Retrying .*attempt [23] of 3", level=logging.INFO):
+            with self.assertRaises(Exception):
+                yield self.http_client.fetch(
+                    "http://127.0.0.1:1/",
+                    connect_timeout=0.5,
+                    request_timeout=1,
+                    max_retries=2,
+                    retry_backoff=0.01,
+                )
 
     def test_redirect_put_with_body(self):
         response = self.fetch(
