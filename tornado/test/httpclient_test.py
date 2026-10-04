@@ -122,6 +122,19 @@ class CountdownHandler(RequestHandler):
             self.write("Zero")
 
 
+class FlakyHandler(RequestHandler):
+    def get(self):
+        token = self.get_argument("token")
+        counters = self.settings.setdefault("flaky_counters", {})
+        counters[token] = counters.get(token, 0) + 1
+        attempt = counters[token]
+        if attempt <= int(self.get_argument("fail_times")):
+            self.set_status(503)
+            self.write("attempt %d failed" % attempt)
+        else:
+            self.write("ok after %d attempts" % attempt)
+
+
 class EchoPostHandler(RequestHandler):
     def post(self):
         self.write(self.request.body)
@@ -303,6 +316,7 @@ class HTTPClientCommonTestCase(AsyncHTTPTestCase):
                 url("/chunk", ChunkHandler),
                 url("/auth", AuthHandler),
                 url("/countdown/([0-9]+)", CountdownHandler, name="countdown"),
+                url("/flaky", FlakyHandler),
                 url("/echopost", EchoPostHandler),
                 url("/user_agent", UserAgentHandler),
                 url("/304_with_content_length", ContentLength304Handler),
@@ -336,6 +350,105 @@ class HTTPClientCommonTestCase(AsyncHTTPTestCase):
         response = self.fetch("/patch", method="PATCH", body=body)
         self.assertEqual(response.code, 200)
         self.assertEqual(response.body, body)
+
+    def test_retry_eventual_success(self):
+        with ExpectLog(
+            gen_log, "Retrying request to .*\\(retry 1 of 2\\)", level=logging.INFO
+        ):
+            response = self.fetch(
+                "/flaky?token=eventual_success&fail_times=1",
+                max_retries=2,
+                retry_backoff=0.01,
+            )
+        self.assertEqual(response.code, 200)
+        self.assertEqual(response.body, b"ok after 2 attempts")
+
+    def test_retry_exhausted(self):
+        with ExpectLog(gen_log, "Retrying request to", level=logging.INFO):
+            response = self.fetch(
+                "/flaky?token=exhausted&fail_times=5",
+                max_retries=2,
+                retry_backoff=0.01,
+            )
+        self.assertEqual(response.code, 503)
+        self.assertEqual(response.body, b"attempt 3 failed")
+
+    def test_retry_exhausted_raise_error(self):
+        with ExpectLog(gen_log, "Retrying request to", level=logging.INFO):
+            with self.assertRaises(HTTPError) as cm:
+                self.fetch(
+                    "/flaky?token=exhausted_raise&fail_times=5",
+                    max_retries=1,
+                    retry_backoff=0.01,
+                    raise_error=True,
+                )
+        self.assertEqual(cm.exception.code, 503)
+
+    def test_retry_disabled_by_default(self):
+        response = self.fetch("/flaky?token=disabled&fail_times=1")
+        self.assertEqual(response.code, 503)
+        self.assertEqual(response.body, b"attempt 1 failed")
+        # A second fetch performs one new attempt (no retries happened).
+        response = self.fetch("/flaky?token=disabled&fail_times=1")
+        self.assertEqual(response.code, 200)
+        self.assertEqual(response.body, b"ok after 2 attempts")
+
+    def test_retry_status_codes_not_matched(self):
+        response = self.fetch(
+            "/flaky?token=codes_not_matched&fail_times=1",
+            max_retries=2,
+            retry_backoff=0.01,
+            retry_status_codes={500},
+        )
+        self.assertEqual(response.code, 503)
+        self.assertEqual(response.body, b"attempt 1 failed")
+
+    def test_retry_timeout_budget_exhausted(self):
+        # First retry at ~0.05s is within the 0.12s budget; the next backoff
+        # (0.1s) would exceed it, so exactly two attempts are made.
+        with ExpectLog(
+            gen_log,
+            "Retrying request to|Not retrying request to",
+            level=logging.INFO,
+        ):
+            response = self.fetch(
+                "/flaky?token=timeout&fail_times=100",
+                max_retries=100,
+                retry_backoff=0.05,
+                retry_timeout=0.12,
+            )
+        self.assertEqual(response.code, 503)
+        self.assertEqual(response.body, b"attempt 2 failed")
+
+    def test_retry_backoff_capped(self):
+        # retry_backoff_max clamps the exponential backoff.
+        with ExpectLog(gen_log, "Retrying request to", level=logging.INFO):
+            response = self.fetch(
+                "/flaky?token=backoff_capped&fail_times=2",
+                max_retries=2,
+                retry_backoff=0.01,
+                retry_backoff_max=0.02,
+            )
+        self.assertEqual(response.code, 200)
+        self.assertEqual(response.body, b"ok after 3 attempts")
+
+    def test_retry_network_error(self):
+        # Nothing is listening on this port; the connection failure
+        # surfaces as 599, which is in the default retry_status_codes.
+        sock, port = bind_unused_port()
+        sock.close()
+        start = time.monotonic()
+        with ExpectLog(gen_log, "Retrying request to", level=logging.INFO):
+            # simple_httpclient raises the raw OSError; curl_httpclient
+            # raises HTTPError 599.
+            with self.assertRaises((HTTPError, OSError)):
+                self.fetch(
+                    f"http://127.0.0.1:{port}/",
+                    max_retries=1,
+                    retry_backoff=0.05,
+                )
+        # The retry waited for the backoff delay before failing again.
+        self.assertGreaterEqual(time.monotonic() - start, 0.04)
 
     def test_hello_world(self):
         response = self.fetch("/hello")

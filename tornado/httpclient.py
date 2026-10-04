@@ -41,7 +41,7 @@ import functools
 import ssl
 import time
 import weakref
-from collections.abc import Awaitable, Callable
+from collections.abc import Awaitable, Callable, Collection
 from io import BytesIO
 from typing import Any, Optional, Type, Union, cast
 
@@ -53,6 +53,7 @@ from tornado.concurrent import (
 )
 from tornado.escape import native_str, utf8
 from tornado.ioloop import IOLoop
+from tornado.log import gen_log
 from tornado.util import Configurable
 
 
@@ -279,6 +280,14 @@ class AsyncHTTPClient(Configurable):
            The ``raise_error=False`` argument only affects the
            `HTTPError` raised when a non-200 response code is used,
            instead of suppressing all errors.
+
+        .. versionchanged:: 6.6
+
+           Added support for retries, configurable per request with the
+           ``HTTPRequest`` parameters ``max_retries``,
+           ``retry_status_codes``, ``retry_backoff``,
+           ``retry_backoff_max``, and ``retry_timeout``. Retries are
+           disabled by default.
         """
         if self._closed:
             raise RuntimeError("fetch() called on closed AsyncHTTPClient")
@@ -303,7 +312,21 @@ class AsyncHTTPClient(Configurable):
                     return
             future_set_result_unless_cancelled(future, response)
 
-        self.fetch_impl(cast(HTTPRequest, request_proxy), handle_response)
+        max_retries = request_proxy.max_retries or 0
+        if max_retries:
+            retrier = _RetryController(
+                self,
+                cast(HTTPRequest, request_proxy),
+                handle_response,
+                max_retries=max_retries,
+                retry_status_codes=request_proxy.retry_status_codes,
+                retry_backoff=request_proxy.retry_backoff,
+                retry_backoff_max=request_proxy.retry_backoff_max,
+                retry_timeout=request_proxy.retry_timeout,
+            )
+            retrier.start()
+        else:
+            self.fetch_impl(cast(HTTPRequest, request_proxy), handle_response)
         return future
 
     def fetch_impl(
@@ -336,6 +359,84 @@ class AsyncHTTPClient(Configurable):
         super().configure(impl, **kwargs)
 
 
+class _RetryController:
+    """Implements the retry policy for a single `.AsyncHTTPClient.fetch`.
+
+    This is a separate class (rather than a closure in ``fetch``) so that
+    the response callback does not end up referring to itself, which would
+    create a reference cycle that defeats CPython's refcounting.
+    """
+
+    def __init__(
+        self,
+        client: "AsyncHTTPClient",
+        request: "HTTPRequest",
+        callback: Callable[["HTTPResponse"], None],
+        *,
+        max_retries: int,
+        retry_status_codes: Collection[int],
+        retry_backoff: float,
+        retry_backoff_max: float,
+        retry_timeout: Optional[float],
+    ) -> None:
+        self._client = client
+        self._request = request
+        self._callback = callback
+        self._max_retries = max_retries
+        self._retry_status_codes = retry_status_codes
+        self._retry_backoff = retry_backoff
+        self._retry_backoff_max = retry_backoff_max
+        self._retry_timeout = retry_timeout
+        self._attempts = 0
+        self._start_time = client.io_loop.time()
+
+    def start(self) -> None:
+        self._client.fetch_impl(self._request, self._handle_response)
+
+    def _retry(self) -> None:
+        self._client.fetch_impl(self._request, self._handle_response)
+
+    def _handle_response(self, response: "HTTPResponse") -> None:
+        if (
+            self._attempts < self._max_retries
+            and response.error is not None
+            and response.code in self._retry_status_codes
+        ):
+            # Network-level errors surface as code 599 even when
+            # response.error is not an HTTPError.
+            delay = min(
+                self._retry_backoff * (2**self._attempts),
+                self._retry_backoff_max,
+            )
+            if (
+                self._retry_timeout is not None
+                and self._client.io_loop.time() - self._start_time + delay
+                > self._retry_timeout
+            ):
+                gen_log.info(
+                    "Not retrying request to %s: retry_timeout of %.2f "
+                    "seconds exhausted after %d attempt(s): %s",
+                    self._request.url,
+                    self._retry_timeout,
+                    self._attempts + 1,
+                    response.error,
+                )
+            else:
+                self._attempts += 1
+                gen_log.info(
+                    "Retrying request to %s in %.2f seconds "
+                    "(retry %d of %d): %s",
+                    self._request.url,
+                    delay,
+                    self._attempts,
+                    self._max_retries,
+                    response.error,
+                )
+                self._client.io_loop.call_later(delay, self._retry)
+                return
+        self._callback(response)
+
+
 class HTTPRequest:
     """HTTP client request object."""
 
@@ -353,6 +454,10 @@ class HTTPRequest:
         proxy_password="",
         allow_nonstandard_methods=False,
         validate_cert=True,
+        max_retries=0,
+        retry_status_codes=frozenset({500, 502, 503, 504, 599}),
+        retry_backoff=0.5,
+        retry_backoff_max=30.0,
     )
 
     def __init__(
@@ -392,6 +497,11 @@ class HTTPRequest:
         expect_100_continue: bool = False,
         decompress_response: bool | None = None,
         ssl_options: dict[str, Any] | ssl.SSLContext | None = None,
+        max_retries: int | None = None,
+        retry_status_codes: Collection[int] | None = None,
+        retry_backoff: float | None = None,
+        retry_backoff_max: float | None = None,
+        retry_timeout: float | None = None,
     ) -> None:
         r"""All parameters except ``url`` are optional.
 
@@ -481,6 +591,27 @@ class HTTPRequest:
            ``Expect: 100-continue`` header and wait for a continue response
            before sending the request body.  Only supported with
            ``simple_httpclient``.
+        :arg int max_retries: Maximum number of times to retry the request
+           after a retryable failure. A failure is retryable if its HTTP
+           status code is in ``retry_status_codes``; network-level errors
+           such as timeouts and refused connections are reported as code
+           599, so include 599 to retry them. Default 0, which disables
+           retries. New in Tornado 6.6.
+        :arg retry_status_codes: HTTP status codes for which the request
+           should be retried. Default
+           ``frozenset({500, 502, 503, 504, 599})``. New in Tornado 6.6.
+        :type retry_status_codes: set[int] or None
+        :arg float retry_backoff: Delay in seconds before the first retry.
+           The delay doubles after each failed attempt (exponential
+           backoff), up to ``retry_backoff_max``. Default 0.5.
+           New in Tornado 6.6.
+        :arg float retry_backoff_max: Upper bound in seconds for the delay
+           between retries. Default 30. New in Tornado 6.6.
+        :arg float retry_timeout: Overall time budget in seconds for the
+           request, including all retries and backoff delays. If starting
+           another retry would exceed the budget, no further retries are
+           attempted and the most recent error is delivered. Default None
+           (no overall budget). New in Tornado 6.6.
 
         .. note::
 
@@ -505,6 +636,10 @@ class HTTPRequest:
 
         .. versionadded:: 4.5
            The ``proxy_auth_mode`` argument.
+
+        .. versionadded:: 6.6
+           The ``max_retries``, ``retry_status_codes``, ``retry_backoff``,
+           ``retry_backoff_max``, and ``retry_timeout`` arguments.
         """
         # Note that some of these attributes go through property setters
         # defined below.
@@ -546,6 +681,11 @@ class HTTPRequest:
         self.client_cert = client_cert
         self.ssl_options = ssl_options
         self.expect_100_continue = expect_100_continue
+        self.max_retries = max_retries
+        self.retry_status_codes = retry_status_codes
+        self.retry_backoff = retry_backoff
+        self.retry_backoff_max = retry_backoff_max
+        self.retry_timeout = retry_timeout
         self.start_time = time.time()
 
     @property
